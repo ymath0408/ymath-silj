@@ -232,7 +232,7 @@ async function save(){
     D.rev=out.rev;setSaveChip('저장됨 '+nowStr().slice(11));
   }catch(e){
     if(e.status===409){alert(e.message);await load();render();}
-    else{dirty=true;setSaveChip('저장 실패 — '+e.message,true);toast('저장하지 못했어요: '+e.message,true)}
+    else{dirty=true;setSaveChip('저장 실패 — 15초 뒤 다시 시도',true);toast('저장하지 못했어요: '+e.message,true);clearTimeout(saveTimer);saveTimer=setTimeout(save,15000)}
   }finally{saving=false}
 }
 async function load(){
@@ -636,9 +636,9 @@ function viewSettings(){
     <div id="backupList" class="small" style="margin-top:12px;max-height:260px;overflow:auto"></div>
   </div></div>
   <div class="panel"><div class="ph"><h2>데이터 폴더 (4대 공유)</h2></div><div class="pb">
-    <p class="small muted" style="margin-top:0">실적 데이터가 저장되는 폴더예요. 4대가 <b>같은 OneDrive 공유 폴더</b>를 지정하면 데이터를 같이 써요. 에듀OK 비밀번호는 여기에 저장되지 않고 각 PC에만 있어요.</p>
+    <p class="small muted" style="margin-top:0">실적 데이터가 저장되는 폴더예요. 4대가 <b>같은 NAS 폴더</b>(예: 5.보스 안의 실적관리 폴더)를 지정하면 데이터를 같이 써요. 드라이브 문자(Z: 등)는 PC마다 다를 수 있어서 <b>\\\\NAS이름\\… 형식</b>을 추천해요. 에듀OK 비밀번호는 여기에 저장되지 않고 각 PC에만 있어요.</p>
     <div class="kv"><span class="muted">지금 폴더</span><span id="dataDirNow" class="small">확인 중…</span>
-    <span class="muted">새 폴더</span><input class="in" id="dataDirIn" data-always="1" placeholder="예: C:\\Users\\ymath\\OneDrive\\Y-MATH 실적 데이터"></div>
+    <span class="muted">새 폴더</span><input class="in" id="dataDirIn" data-always="1" placeholder="예: \\\\NAS이름\\5.보스\\실적관리"></div>
     <div class="row" style="margin-top:12px"><button class="btn" data-act="dataDirSet" ${SERVER?'':'disabled'}>이 폴더로 바꾸기</button></div>
     <p class="small muted">새 폴더에 데이터가 없으면 지금 데이터를 복사해 가고, 이미 있으면(다른 PC가 먼저 지정) 그 데이터를 써요.</p>
   </div></div>
@@ -660,8 +660,9 @@ async function loadSettingsAsync(){
     $('#credState').innerHTML=c.saved?(c.readable?`<span class="badge b-green">저장됨</span> 아이디 <b>${esc(c.id)}</b> · ${esc(c.at||'')}`:`<span class="badge b-red">다시 저장 필요</span> 이 컴퓨터에서 읽을 수 없어요.`):'<span class="badge b-warn">아직 없음</span> 아이디와 비밀번호를 저장해 주세요.';
     if(c.id&&!$('#eokId').value)$('#eokId').value=c.id;
   }catch(e){$('#credState').textContent='확인 실패: '+e.message}
-  try{const d=await api('/api/datadir');$('#dataDirNow').textContent=d.dir+(d.dir===d.default?' (이 PC 전용 기본 폴더)':'');}catch(e){}
-  try{const v=await api('/api/version');$('#verNow').textContent='지금 v'+v.version+' · '+v.pc;
+  try{const d=await api('/api/datadir');$('#dataDirNow').innerHTML=esc(d.dir)+(d.dir===d.default?' <span class="badge b-warn">이 PC 전용 기본 폴더</span>':(d.online===false?' <span class="badge b-red">연결 안 됨</span>':' <span class="badge b-green">공유 폴더</span>'));}catch(e){}
+  try{const v=await api('/api/version');$('#verNow').textContent='지금 v'+v.version+' · '+v.pc+(v.nas?' · NAS 모드':'');
+    if(v.nas){$('#updState').innerHTML='<span class="badge b-green">NAS 모드</span> 프로그램이 NAS에 있어요. NAS의 프로그램 파일이 새 버전으로 바뀌면 다음에 열 때 자동으로 적용돼요.';const b=document.querySelector('[data-act=updCheck]');if(b)b.style.display='none'}
     $('#rbList').innerHTML=v.backups.length?'<div class="muted" style="margin-bottom:6px">이전 버전으로 되돌리기 (새 버전에 문제가 있을 때)</div>'+v.backups.map(b=>`<div class="row" style="justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--line)"><span>${esc(b)}</span><button class="btn sm" data-act="rollback" data-k="${esc(b)}">되돌리기</button></div>`).join(''):''}catch(e){}
   try{const b=await api('/api/backups');$('#backupList').innerHTML=b.files.length?b.files.map(f=>`<div class="row" style="justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--line)"><span>${esc(f)}</span>${EDIT?`<button class="btn sm" data-act="restore" data-k="${esc(f)}">이걸로 복원</button>`:''}</div>`).join(''):'<span class="muted">아직 백업이 없어요.</span>'}catch(e){}
 }
@@ -988,9 +989,21 @@ setInterval(async()=>{
   try{const r=await api('/api/rev');if(r.rev!==D.rev){await load();render();toast('다른 컴퓨터에서 바뀐 내용을 불러왔어요')}}catch(e){}
 },30000);
 
+function showLoadError(e){
+  const off=e.body&&e.body.offline;
+  document.getElementById('main').innerHTML=`<div class="panel"><div class="empty"><h3>${off?'데이터 폴더(NAS)에 연결할 수 없어요':'데이터를 불러오지 못했어요'}</h3>
+    <p>${esc(e.message)}</p>
+    <p class="small">이 PC에서 파일 탐색기로 그 폴더가 열리는지 먼저 확인해 주세요. NAS가 꺼져 있거나 네트워크가 끊기면 이렇게 떠요.</p>
+    <div class="row" style="justify-content:center;margin-top:16px"><button class="btn pri" onclick="location.reload()">다시 시도</button></div>
+    ${off?`<div class="row" style="justify-content:center;margin-top:22px"><input class="in" id="ddFix" style="width:420px" placeholder="다른 경로로 바꾸기: \\\\NAS이름\\5.보스\\실적관리" value="${esc(e.body.dir||'')}"><button class="btn" id="ddFixBtn">이 경로로 바꾸기</button></div>`:''}
+  </div></div>`;
+  const b=document.getElementById('ddFixBtn');
+  if(b)b.onclick=async()=>{try{await api('/api/datadir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:document.getElementById('ddFix').value.trim()})});location.reload()}catch(err){toast(err.message,true)}};
+}
+
 /* ---------- 시작 ---------- */
 (async function(){
-  try{await load()}catch(e){document.getElementById('main').innerHTML=`<div class="banner err">데이터를 불러오지 못했어요: ${esc(e.message)}</div>`;return}
+  try{await load()}catch(e){showLoadError(e);return}
   const live=Object.keys(D.months).filter(k=>D.months[k].kind==='live'&&!D.months[k].closed).sort().pop();
   MONTH=live||ymOf(new Date());
   render();

@@ -5,11 +5,19 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $Host.UI.RawUI.WindowTitle = 'Y-MATH 실적관리 (이 창을 닫으면 프로그램이 꺼져요)'
 
-$AppVersion = '1.0.0'
+$AppVersion = '1.0.1'
 $RepoRaw    = 'https://raw.githubusercontent.com/ymath0408/ymath-silj/main'
 $Root       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptPath = $MyInvocation.MyCommand.Path
-$LocalDir   = Join-Path $Root 'local'          # 이 PC 전용 (에듀OK 비밀번호, 설정, 코드 백업)
+# 프로그램이 NAS(네트워크 폴더)에 있으면 'NAS 모드': GitHub 대신 NAS 파일이 바뀌면 자동 적용
+$IsNetwork = $false
+try {
+  if ($Root.StartsWith('\\')) { $IsNetwork = $true }
+  else { $IsNetwork = ((New-Object System.IO.DriveInfo([IO.Path]::GetPathRoot($Root))).DriveType -eq 'Network') }
+} catch {}
+$VersionFile = Join-Path $Root 'version.json'
+$PcName     = ($env:COMPUTERNAME -replace '[^\w-]', '')
+$LocalDir   = Join-Path (Join-Path $Root 'local') $PcName   # 이 PC 전용 (에듀OK 비밀번호, 설정, 코드 백업) - 프로그램을 NAS에 둬도 PC끼리 안 섞임
 $ConfigFile = Join-Path $LocalDir 'config.json'
 $CredFile   = Join-Path $LocalDir 'eok.cred'
 $LogFile    = Join-Path $LocalDir 'server.log'
@@ -25,6 +33,12 @@ $script:LastAutoBackup = [DateTime]::MinValue
 $script:Restart = $false
 
 New-Item -ItemType Directory -Force -Path $LocalDir | Out-Null
+# v1.0.0은 local\ 바로 아래에 저장했음 → 이 PC 폴더로 옮김
+foreach ($n in @('config.json', 'eok.cred', 'update_note.json')) {
+  $old = Join-Path (Join-Path $Root 'local') $n
+  $new = Join-Path $LocalDir $n
+  if ((Test-Path $old) -and -not (Test-Path $new)) { try { Move-Item $old $new -Force } catch {} }
+}
 
 function Load-Config {
   if (Test-Path $ConfigFile) { try { return ([IO.File]::ReadAllText($ConfigFile, $Utf8) | ConvertFrom-Json) } catch {} }
@@ -39,7 +53,16 @@ function Set-DataDir([string]$dir) {
   New-Item -ItemType Directory -Force -Path $script:DataDir, $script:BackupDir | Out-Null
 }
 $cfg0 = Load-Config
-if ($cfg0.dataDir -and (Test-Path $cfg0.dataDir)) { Set-DataDir $cfg0.dataDir } else { Set-DataDir (Join-Path $Root 'data') }
+$script:DataOffline = $null
+if ($cfg0.dataDir) {
+  # 지정한 공유 폴더(NAS)가 안 열리면 이 PC 폴더로 몰래 바꾸지 않고 오류로 알림 (데이터가 갈라지는 것 방지)
+  if (Test-Path -LiteralPath $cfg0.dataDir) { Set-DataDir $cfg0.dataDir } else { $script:DataOffline = [string]$cfg0.dataDir; $script:DataDir = $script:DataOffline; $script:DataFile = Join-Path $script:DataOffline 'silj.json'; $script:BackupDir = Join-Path $script:DataOffline 'backup' }
+} else { Set-DataDir (Join-Path $Root 'data') }
+function Test-DataOnline {
+  if ($script:DataOffline -eq $null) { return $true }
+  if (Test-Path -LiteralPath $script:DataOffline) { Set-DataDir $script:DataOffline; $script:DataOffline = $null; Write-Log ('데이터 폴더 다시 연결됨: ' + $script:DataDir); return $true }
+  return $false
+}
 
 function Write-Log([string]$msg) {
   $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $msg
@@ -86,7 +109,7 @@ function Read-Request($stream) {
 }
 
 function Send-Bytes($stream, [int]$code, [string]$ctype, [byte[]]$bytes) {
-  $status = @{ 200 = 'OK'; 400 = 'Bad Request'; 403 = 'Forbidden'; 404 = 'Not Found'; 409 = 'Conflict'; 500 = 'Internal Server Error' }[$code]
+  $status = @{ 200 = 'OK'; 400 = 'Bad Request'; 403 = 'Forbidden'; 404 = 'Not Found'; 409 = 'Conflict'; 500 = 'Internal Server Error'; 503 = 'Service Unavailable' }[$code]
   $h = "HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bytes.Length)`r`nCache-Control: no-store`r`nX-Content-Type-Options: nosniff`r`nConnection: close`r`n`r`n"
   $hb = [Text.Encoding]::ASCII.GetBytes($h)
   $stream.Write($hb, 0, $hb.Length)
@@ -213,6 +236,10 @@ function Get-RemoteVersion {
   $ms = $r.RawContentStream; $ms.Position = 0
   return ($Utf8.GetString($ms.ToArray()) | ConvertFrom-Json)
 }
+function Get-LocalVersionInfo {
+  if (-not (Test-Path -LiteralPath $VersionFile)) { return $null }
+  try { return ([IO.File]::ReadAllText($VersionFile, $Utf8) | ConvertFrom-Json) } catch { return $null }
+}
 function Is-Newer([string]$remote, [string]$local) { try { return ([version]$remote -gt [version]$local) } catch { return $false } }
 function Install-Update($info) {
   $tmp = Join-Path $LocalDir 'update_tmp'
@@ -263,11 +290,23 @@ function Handle-Client($client) {
   try {
     switch ($req.Path) {
       '/' {
+        if ($IsNetwork) {
+          $li = Get-LocalVersionInfo
+          if ($li -ne $null -and [string]$li.version -ne $AppVersion) {
+            $note = @{ from = $AppVersion; to = [string]$li.version; notes = @($li.notes); at = (Get-Date -Format 'yyyy-MM-dd HH:mm'); seen = $false }
+            [IO.File]::WriteAllText($NoteFile, ($note | ConvertTo-Json -Compress -Depth 4), $Utf8)
+            Write-Log ('NAS 새 버전 적용: v' + $AppVersion + ' -> v' + $li.version)
+            Send-Text $stream 200 'text/html; charset=utf-8' '<!DOCTYPE html><meta charset="utf-8"><meta http-equiv="refresh" content="4"><body style="background:#141821;color:#e7eaf1;font-family:Malgun Gothic,sans-serif;display:flex;align-items:center;justify-content:center;height:90vh"><h2>새 버전으로 바꾸는 중이에요… 잠시만요</h2></body>'
+            $script:Restart = $true; $script:Quit = $true
+            return
+          }
+        }
         $html = [IO.File]::ReadAllBytes($AppFile)
         Send-Bytes $stream 200 'text/html; charset=utf-8' $html
       }
       '/api/ping' { Send-Json $stream 200 @{ ok = $true; pc = $env:COMPUTERNAME; root = $Root } }
       '/api/data' {
+        if (-not (Test-DataOnline)) { Send-Json $stream 503 @{ error = ('데이터 폴더에 연결할 수 없어요: ' + $script:DataOffline + ' — NAS가 켜져 있는지, 이 PC에서 그 폴더가 열리는지 확인해 주세요.'); offline = $true; dir = $script:DataOffline }; return }
         if ($req.Method -eq 'GET') {
           if (Test-Path $DataFile) { Send-Bytes $stream 200 'application/json; charset=utf-8' ([IO.File]::ReadAllBytes($DataFile)) }
           else { Send-Text $stream 200 'application/json; charset=utf-8' '{"rev":0}' }
@@ -283,10 +322,12 @@ function Handle-Client($client) {
         }
       }
       '/api/backup' {
+        if (-not (Test-DataOnline)) { Send-Json $stream 503 @{ error = ('데이터 폴더에 연결할 수 없어요: ' + $script:DataOffline + ' — NAS가 켜져 있는지, 이 PC에서 그 폴더가 열리는지 확인해 주세요.'); offline = $true; dir = $script:DataOffline }; return }
         $name = Backup-Data (Get-QueryParam $req.Query 'reason')
         Send-Json $stream 200 @{ ok = $true; name = $name }
       }
       '/api/backups' {
+        if (-not (Test-DataOnline)) { Send-Json $stream 503 @{ error = ('데이터 폴더에 연결할 수 없어요: ' + $script:DataOffline + ' — NAS가 켜져 있는지, 이 PC에서 그 폴더가 열리는지 확인해 주세요.'); offline = $true; dir = $script:DataOffline }; return }
         $files = @(Get-ChildItem $BackupDir -Filter 'silj_*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object { $_.Name })
         Send-Json $stream 200 @{ files = $files }
       }
@@ -334,14 +375,16 @@ function Handle-Client($client) {
         $note = $null
         if (Test-Path $NoteFile) { try { $note = [IO.File]::ReadAllText($NoteFile, $Utf8) | ConvertFrom-Json } catch {} }
         if ($note -ne $null -and -not $note.seen) { $note.seen = $true; [IO.File]::WriteAllText($NoteFile, ($note | ConvertTo-Json -Compress -Depth 4), $Utf8); $note.seen = $false }
-        Send-Json $stream 200 @{ version = $AppVersion; note = $note; backups = (Get-CodeBackups); pc = $env:COMPUTERNAME }
+        Send-Json $stream 200 @{ version = $AppVersion; note = $note; backups = (Get-CodeBackups); pc = $env:COMPUTERNAME; nas = $IsNetwork; root = $Root }
       }
       '/api/update/check' {
+        if ($IsNetwork) { Send-Json $stream 200 @{ current = $AppVersion; latest = $AppVersion; newer = $false; nas = $true; notes = @() }; return }
         try { $info = Get-RemoteVersion; Send-Json $stream 200 @{ current = $AppVersion; latest = [string]$info.version; newer = (Is-Newer ([string]$info.version) $AppVersion); notes = @($info.notes) } }
         catch { Send-Json $stream 500 @{ error = ('업데이트 정보를 받지 못했어요: ' + $_.Exception.Message) } }
       }
       '/api/update/apply' {
         try {
+          if ($IsNetwork) { Send-Json $stream 200 @{ ok = $true; same = $true }; return }
           $info = Get-RemoteVersion
           if (-not (Is-Newer ([string]$info.version) $AppVersion)) { Send-Json $stream 200 @{ ok = $true; same = $true }; return }
           Install-Update $info
@@ -360,20 +403,25 @@ function Handle-Client($client) {
         Send-Json $stream 200 @{ ok = $true }
         $script:Restart = $true; $script:Quit = $true
       }
-      '/api/rev' { Send-Json $stream 200 @{ rev = (Get-FileRev) } }
+      '/api/rev' {
+        if (-not (Test-DataOnline)) { Send-Json $stream 503 @{ error = ('데이터 폴더에 연결할 수 없어요: ' + $script:DataOffline + ' — NAS가 켜져 있는지, 이 PC에서 그 폴더가 열리는지 확인해 주세요.'); offline = $true; dir = $script:DataOffline }; return }
+        Send-Json $stream 200 @{ rev = (Get-FileRev) }
+      }
       '/api/datadir' {
         if ($req.Method -eq 'GET') {
-          $conf = @(Get-ChildItem $DataDir -Filter 'silj*.json' -File | Where-Object { $_.Name -ne 'silj.json' } | ForEach-Object { $_.Name })
-          Send-Json $stream 200 @{ dir = $DataDir; default = (Join-Path $Root 'data'); conflicts = $conf }
+          $online = Test-DataOnline
+          $conf = @()
+          if ($online) { $conf = @(Get-ChildItem -LiteralPath $DataDir -Filter 'silj*.json' -File | Where-Object { $_.Name -ne 'silj.json' } | ForEach-Object { $_.Name }) }
+          Send-Json $stream 200 @{ dir = $DataDir; default = (Join-Path $Root 'data'); conflicts = $conf; online = $online }
         } else {
           $o = $req.Body | ConvertFrom-Json
           $dir = ([string]$o.dir).Trim().Trim('"')
-          if (-not [IO.Path]::IsPathRooted($dir)) { Send-Json $stream 400 @{ error = '전체 경로를 넣어 주세요. 예: C:\Users\ymath\OneDrive\Y-MATH 실적 데이터' }; return }
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          if (-not [IO.Path]::IsPathRooted($dir)) { Send-Json $stream 400 @{ error = '전체 경로를 넣어 주세요. 예: \\NAS이름\5.보스\실적관리' }; return }
+          try { New-Item -ItemType Directory -Force -Path $dir | Out-Null } catch { Send-Json $stream 400 @{ error = ('그 폴더를 만들거나 열 수 없어요: ' + $dir) }; return }
           $target = Join-Path $dir 'silj.json'
           $mode = 'use'
-          if (-not (Test-Path $target) -and (Test-Path $DataFile)) { Copy-Item $DataFile $target; $mode = 'copied' }
-          Set-DataDir $dir
+          if (-not (Test-Path -LiteralPath $target) -and $script:DataOffline -eq $null -and (Test-Path -LiteralPath $DataFile)) { Copy-Item -LiteralPath $DataFile $target; $mode = 'copied' }
+          Set-DataDir $dir; $script:DataOffline = $null
           $cfg = Load-Config; $cfg | Add-Member -NotePropertyName dataDir -NotePropertyValue $dir -Force; Save-Config $cfg
           Write-Log ('데이터 폴더 변경: ' + $dir + ' (' + $mode + ')')
           Send-Json $stream 200 @{ ok = $true; dir = $dir; mode = $mode }
@@ -390,7 +438,7 @@ function Handle-Client($client) {
 
 # ---------------- 시작 ----------------
 # 켤 때 새 버전이 있으면 자동으로 설치하고 다시 켬
-if (-not $NoBrowser) {
+if (-not $NoBrowser -and -not $IsNetwork) {
   try {
     $info = Get-RemoteVersion
     $skip = [string](Load-Config).skipVersion
@@ -414,7 +462,7 @@ if (-not $started) {
   Start-Process "http://localhost:$Port/"
   exit
 }
-Write-Log ("실적관리 v$AppVersion 시작 (http://localhost:$Port/)  데이터: $DataDir")
+Write-Log ("실적관리 v$AppVersion 시작 (http://localhost:$Port/)  데이터: $DataDir" + $(if ($IsNetwork) { '  [NAS 모드]' } else { '' }))
 if (-not $NoBrowser) { Start-Process "http://localhost:$Port/" }
 $script:Quit = $false
 # 브라우저가 미리 열어두는 빈 연결 때문에 멈추지 않도록, 데이터가 온 연결부터 처리
